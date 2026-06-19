@@ -1,0 +1,10 @@
+.claude/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+.venv/
+venv/
+config.yaml
+*.local.yaml
+state.json

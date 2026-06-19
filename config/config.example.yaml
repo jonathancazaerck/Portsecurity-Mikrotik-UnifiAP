@@ -1,0 +1,59 @@
+# Copy to config.yaml and adjust to your environment.
+# Passwords are NOT stored here - they come from environment variables
+# (WATCHDOG_UNIFI_PASSWORD, WATCHDOG_MIKROTIK_PASSWORD).
+
+# How often (seconds) each ap_port is reconciled: the switch's own bridge
+# host table + link state decide whether a known AP is present, the UniFi
+# controller only supplies the list of known AP MAC addresses.
+poll_interval: 5
+
+unifi:
+  url: "https://192.0.2.1"
+  username: "watchdog"
+  password_env: "WATCHDOG_UNIFI_PASSWORD"
+  site: "default"
+  # Self-signed cert on the controller -> verification disabled.
+  verify_ssl: false
+
+# VLAN layout shared by all switches.
+vlans:
+  # Default ("safe") VLAN for ports without a connected/adopted AP.
+  # dot1x is ENABLED on ports in this VLAN.
+  onboarding: 99
+  # Untagged/PVID VLAN used for AP management once the AP is online.
+  management: 10
+  # Tagged VLANs carried to the AP for client SSIDs once it is online.
+  trunk: [30, 50]
+
+switches:
+  - name: sw01
+    host: "192.0.2.2"
+    port: 8729
+    username: "watchdog"
+    password_env: "WATCHDOG_MIKROTIK_PASSWORD"
+    # Name of the VLAN-filtering bridge on this switch.
+    bridge: "bridge1"
+    # Ports that may have an AP connected. These are the only ports the
+    # watchdog and the setup script will ever touch.
+    ap_ports:
+      - ether2
+      - ether3
+      - ether4
+      - ether5
+      - ether6
+      - ether7
+      - ether8
+
+# Dead-man's-switch: each switch pings the host running this watchdog.
+# If it stops responding, the switch reverts all ap_ports of that switch
+# back to the onboarding VLAN + dot1x on its own, independent of the
+# Python process.
+#   interval:      how often the switch pings watchdog_host.
+#   probe_timeout: max time to wait for a ping reply each interval; the
+#                   down-script fires on the first missed reply, so detection
+#                   takes roughly one interval. RouterOS requires
+#                   interval >= probe_timeout.
+netwatch:
+  watchdog_host: "192.0.2.10"
+  interval: "10s"
+  probe_timeout: "1s"

@@ -1,0 +1,44 @@
+#!/bin/sh
+#
+# PROVIDE: ap_switch_watchdog
+# REQUIRE: NETWORKING
+# KEYWORD: shutdown
+#
+# Add the following to /etc/rc.conf to enable:
+#   ap_switch_watchdog_enable="YES"
+#
+# Optional /etc/rc.conf overrides:
+#   ap_switch_watchdog_config="%%PREFIX%%/etc/ap-switch-watchdog/config.yaml"
+#   ap_switch_watchdog_env_file="%%PREFIX%%/etc/ap-switch-watchdog/env"
+#   ap_switch_watchdog_logfile="/var/log/ap_switch_watchdog.log"
+
+. /etc/rc.subr
+
+name="ap_switch_watchdog"
+rcvar="ap_switch_watchdog_enable"
+desc="MikroTik/UniFi AP switch port watchdog"
+
+load_rc_config "$name"
+
+: ${ap_switch_watchdog_enable:="NO"}
+: ${ap_switch_watchdog_config:="%%PREFIX%%/etc/ap-switch-watchdog/config.yaml"}
+: ${ap_switch_watchdog_env_file:="%%PREFIX%%/etc/ap-switch-watchdog/env"}
+: ${ap_switch_watchdog_logfile:="/var/log/${name}.log"}
+
+watchdog_bin="%%PREFIX%%/libexec/ap-switch-watchdog/venv/bin/ap-switch-watchdog"
+pidfile="/var/run/${name}.pid"
+command="/usr/sbin/daemon"
+command_args="-r -P ${pidfile} -o ${ap_switch_watchdog_logfile} ${watchdog_bin} -c ${ap_switch_watchdog_config}"
+
+start_precmd="ap_switch_watchdog_prestart"
+
+ap_switch_watchdog_prestart()
+{
+	if [ -f "${ap_switch_watchdog_env_file}" ]; then
+		set -a
+		. "${ap_switch_watchdog_env_file}"
+		set +a
+	fi
+}
+
+run_rc_command "$1"
