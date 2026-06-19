@@ -25,6 +25,8 @@ logger = logging.getLogger(__name__)
 
 # Device "type" reported by the controller for UniFi access points.
 AP_DEVICE_TYPE = "uap"
+# ``state`` value indicating the AP has an active management session.
+STATE_CONNECTED = 1
 
 
 class UniFiError(Exception):
@@ -87,26 +89,38 @@ class UniFiClient:
         self._api_prefix = ""
         logger.debug("logged in to %s as classic controller", self.base_url)
 
-    def get_known_ap_macs(self) -> set[str]:
-        """Return the MAC addresses (lowercase) of all APs known to the controller.
+    def get_ap_macs(self) -> tuple[set[str], set[str]]:
+        """Return ``(known_macs, connected_macs)`` for all APs on this controller.
 
-        This deliberately ignores the per-device ``state`` (online/offline)
-        field, which the controller derives from missed heartbeats and can
-        lag 30-70+ seconds behind reality after a VLAN change. The watchdog
-        only uses this as a security allowlist - "is this MAC address a
-        UniFi AP the controller knows about" - and answers "is it actually
-        present right now" from the switch's own bridge host table and link
-        state instead, which are effectively instant.
+        Both sets contain lowercase-normalised MAC addresses and are computed
+        from a single ``stat/device`` API call.
+
+        ``known_macs`` — the security allowlist: every AP MAC address that has
+        ever been adopted by this controller, regardless of current online /
+        offline state.  Used to identify a device as "AP" vs. "unknown client"
+        from the switch bridge host table.
+
+        ``connected_macs`` — subset of ``known_macs`` where ``state ==
+        STATE_CONNECTED``, meaning the AP currently has an active management
+        session with the controller.  Used as a second guard for the
+        onboarding → trunk transition: a device spoofing a known-but-offline
+        AP's MAC will not be granted trunk access, because the real AP is not
+        simultaneously connected to the controller.
         """
         devices = self._get_devices()
-        macs = set()
+        known: set[str] = set()
+        connected: set[str] = set()
         for device in devices:
             if device.get("type") != AP_DEVICE_TYPE:
                 continue
             mac = device.get("mac")
-            if mac:
-                macs.add(mac.lower())
-        return macs
+            if not mac:
+                continue
+            mac = mac.lower()
+            known.add(mac)
+            if device.get("state") == STATE_CONNECTED:
+                connected.add(mac)
+        return known, connected
 
     def _get_devices(self) -> list[dict]:
         if self._api_prefix is None:

@@ -88,7 +88,7 @@ def test_login_failure_raises():
         client.login()
 
 
-def test_get_known_ap_macs_filters_to_uap_and_lowercases(monkeypatch):
+def test_get_ap_macs_filters_to_uap_lowercases_and_splits_connected(monkeypatch):
     devices_url = ("GET", "https://192.0.2.1/proxy/network/api/s/default/stat/device")
     client, session = make_client(
         {
@@ -98,10 +98,11 @@ def test_get_known_ap_macs_filters_to_uap_and_lowercases(monkeypatch):
                 {
                     "data": [
                         {"type": "uap", "mac": "aa:bb:cc:dd:ee:01", "state": 1},
-                        # Known APs are returned regardless of "state".
+                        # Known but not connected (state != 1).
                         {"type": "uap", "mac": "aa:bb:cc:dd:ee:02", "state": 0},
                         # MACs are normalized to lowercase.
                         {"type": "uap", "mac": "AA:BB:CC:DD:EE:03", "state": 1},
+                        # Non-AP devices are excluded from both sets.
                         {"type": "usw", "mac": "aa:bb:cc:dd:ee:04", "state": 1},
                     ]
                 },
@@ -109,12 +110,13 @@ def test_get_known_ap_macs_filters_to_uap_and_lowercases(monkeypatch):
         }
     )
 
-    result = client.get_known_ap_macs()
+    known, connected = client.get_ap_macs()
 
-    assert result == {"aa:bb:cc:dd:ee:01", "aa:bb:cc:dd:ee:02", "aa:bb:cc:dd:ee:03"}
+    assert known == {"aa:bb:cc:dd:ee:01", "aa:bb:cc:dd:ee:02", "aa:bb:cc:dd:ee:03"}
+    assert connected == {"aa:bb:cc:dd:ee:01", "aa:bb:cc:dd:ee:03"}
 
 
-def test_get_known_ap_macs_relogs_in_on_401():
+def test_get_ap_macs_relogs_in_on_401():
     devices_url = ("GET", "https://192.0.2.1/proxy/network/api/s/default/stat/device")
     client, session = make_client(
         {
@@ -126,14 +128,15 @@ def test_get_known_ap_macs_relogs_in_on_401():
         }
     )
 
-    result = client.get_known_ap_macs()
+    known, connected = client.get_ap_macs()
 
-    assert result == {"aa:bb:cc:dd:ee:01"}
+    assert known == {"aa:bb:cc:dd:ee:01"}
+    assert connected == {"aa:bb:cc:dd:ee:01"}
     # login, devices(401), login again, devices(200)
     assert len(session.calls) == 4
 
 
-def test_get_known_ap_macs_raises_on_persistent_error():
+def test_get_ap_macs_raises_on_persistent_error():
     devices_url = ("GET", "https://192.0.2.1/proxy/network/api/s/default/stat/device")
     client, session = make_client(
         {
@@ -143,7 +146,7 @@ def test_get_known_ap_macs_raises_on_persistent_error():
     )
 
     with pytest.raises(UniFiError):
-        client.get_known_ap_macs()
+        client.get_ap_macs()
 
 
 def test_login_network_error_raises():

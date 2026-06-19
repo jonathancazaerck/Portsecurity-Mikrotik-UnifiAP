@@ -11,13 +11,16 @@ OTHER_DEVICE = "aa:bb:cc:dd:ee:99"
 
 
 class FakeUniFiClient:
-    def __init__(self, known_macs: set[str]):
+    def __init__(self, known_macs: set[str], connected_macs: set[str] | None = None):
         self.known_macs = set(known_macs)
+        # Default: all known APs are also connected (simplifies tests that
+        # don't care about the distinction).
+        self.connected_macs = set(connected_macs) if connected_macs is not None else set(known_macs)
         self.calls = 0
 
-    def get_known_ap_macs(self) -> set[str]:
+    def get_ap_macs(self) -> tuple[set[str], set[str]]:
         self.calls += 1
-        return set(self.known_macs)
+        return set(self.known_macs), set(self.connected_macs)
 
 
 def _vlan(db, vlan_id):
@@ -68,8 +71,8 @@ def sw01(config, vlans):
     return db, client
 
 
-def make_watchdog(config, sw01_client, known_ap_macs):
-    unifi = FakeUniFiClient(known_ap_macs)
+def make_watchdog(config, sw01_client, known_ap_macs, connected_ap_macs=None):
+    unifi = FakeUniFiClient(known_ap_macs, connected_ap_macs)
     return APSwitchWatchdog(config, unifi_client=unifi, switches={"sw01": sw01_client}), unifi
 
 
@@ -260,7 +263,7 @@ def test_unifi_error_skips_poll_cycle(config, sw01, vlans):
     db, client = sw01
 
     class FailingUniFi:
-        def get_known_ap_macs(self):
+        def get_ap_macs(self):
             raise UniFiError("boom")
 
     wd = APSwitchWatchdog(config, unifi_client=FailingUniFi(), switches={"sw01": client})
@@ -282,3 +285,37 @@ def test_bridge_host_query_failure_skips_switch(config, sw01, vlans):
     wd.poll_once()  # must not raise
 
     assert _port(db, "ether2")["pvid"] == str(vlans.onboarding)
+
+
+# -- anti-spoofing: onboarding -> trunk requires UniFi connected ---------------
+
+
+def test_known_ap_not_connected_to_unifi_stays_onboarding(config, sw01, vlans):
+    db, client = sw01
+    # AP1 is in the bridge host table and known to UniFi, but its management
+    # session is currently not active (e.g. still booting, or a spoofer using
+    # the MAC of a registered-but-offline AP).
+    wd, unifi = make_watchdog(config, client, known_ap_macs={AP1}, connected_ap_macs=set())
+
+    wd.poll_once()
+
+    assert _port(db, "ether2")["pvid"] == str(vlans.onboarding)
+    assert _dot1x(db, "ether2")["disabled"] == "no"
+
+
+def test_trunked_port_stays_trunked_when_ap_drops_from_unifi(config, sw01, vlans):
+    db, client = sw01
+    wd, unifi = make_watchdog(config, client, {AP1})
+    wd.poll_once()  # AP1 connected -> trunk (touched)
+    wd.poll_once()  # settle cycle
+
+    # AP temporarily loses its UniFi management session (heartbeat lag,
+    # brief controller outage, VLAN change settling ...) while the MAC is
+    # still in the bridge host table and the link is still up.
+    # The port must stay in trunk - this is the core protection against
+    # heartbeat-lag false reverts.
+    unifi.connected_macs = set()
+    wd.poll_once()
+
+    assert _port(db, "ether2")["pvid"] == str(vlans.management)
+    assert _dot1x(db, "ether2")["disabled"] == "yes"

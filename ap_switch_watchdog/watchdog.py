@@ -9,15 +9,28 @@ against its *actual* current mode:
 2. ``MikroTikClient.get_port_link_status`` - whether the port currently has a
    physical link (``/interface`` ``running``), which RouterOS reflects
    essentially instantly.
-3. ``UniFiClient.get_known_ap_macs`` - the set of MAC addresses belonging to
-   access points the UniFi controller knows about. This is a security
-   allowlist only, independent of an AP's currently reported online/offline
-   *state*, which can lag 30-70+ seconds behind reality after a VLAN change.
+3. ``UniFiClient.get_ap_macs`` - ``(known_macs, connected_macs)`` from a
+   single ``stat/device`` call. ``known_macs`` is the security allowlist
+   (every ever-adopted AP MAC, regardless of online/offline state).
+   ``connected_macs`` is the subset where the AP currently has an active
+   management session with the controller (``state == 1``).
 
-Desired mode for a port is ``"trunk"`` if its link is up *and* the bridge has
-learned a known AP's MAC on it, otherwise ``"onboarding"``. The port's actual
-mode is read live via ``MikroTikClient.get_port_pvid`` and
-``MikroTikClient.get_dot1x_disabled`` (PVID == management VLAN *and* dot1x
+Desired mode uses an **asymmetric rule** to close the MAC-spoofing window
+without reintroducing heartbeat-lag false reverts:
+
+* **onboarding → trunk**: link up *and* bridge has a ``known_macs`` MAC on
+  the port *and* that MAC is in ``connected_macs``.  The connected check
+  means a device spoofing a known-but-offline AP's MAC is not granted trunk
+  access: the real AP would need to be simultaneously online, which would
+  immediately displace it from the management VLAN and cause it to disconnect
+  from the controller - making ``connected_macs`` go empty quickly.
+* **trunk → onboarding**: the known AP's MAC disappears from the bridge host
+  table *or* the link drops.  UniFi's ``connected`` state is deliberately
+  *not* checked here - heartbeat lag (30-70 s) would cause false reverts right
+  after every mode switch.
+
+The port's actual current mode is read live via ``MikroTikClient.get_port_pvid``
+and ``MikroTikClient.get_dot1x_disabled`` (PVID == management VLAN *and* dot1x
 disabled -> ``"trunk"``; checking both means a partially-applied mode switch
 is retried next cycle instead of being mistaken for "done"). If desired !=
 actual, ``MikroTikClient.set_port_mode`` applies the VLAN/dot1x change and
@@ -88,7 +101,7 @@ class APSwitchWatchdog:
 
     def poll_once(self) -> None:
         try:
-            known_ap_macs = self.unifi.get_known_ap_macs()
+            known_ap_macs, connected_ap_macs = self.unifi.get_ap_macs()
         except UniFiError:
             logger.exception("failed to query UniFi controller")
             return
@@ -99,7 +112,7 @@ class APSwitchWatchdog:
         for sw in self.config.switches:
             client = self.switches[sw.name]
             try:
-                self._reconcile_switch(sw, client, known_ap_macs, touched_last_cycle)
+                self._reconcile_switch(sw, client, known_ap_macs, connected_ap_macs, touched_last_cycle)
             except Exception:
                 logger.exception("failed to reconcile ports on %s", sw.name)
 
@@ -108,6 +121,7 @@ class APSwitchWatchdog:
         sw: SwitchConfig,
         client: MikroTikClient,
         known_ap_macs: set[str],
+        connected_ap_macs: set[str],
         touched_last_cycle: set[tuple[str, str]],
     ) -> None:
         macs_by_port: dict[str, list[str]] = {}
@@ -118,7 +132,7 @@ class APSwitchWatchdog:
             if (sw.name, port) in touched_last_cycle:
                 continue
             try:
-                self._reconcile_port(sw.name, client, port, macs_by_port.get(port, []), known_ap_macs)
+                self._reconcile_port(sw.name, client, port, macs_by_port.get(port, []), known_ap_macs, connected_ap_macs)
             except Exception:
                 logger.exception("failed to reconcile %s/%s", sw.name, port)
 
@@ -129,24 +143,40 @@ class APSwitchWatchdog:
         port: str,
         macs_on_port: list[str],
         known_ap_macs: set[str],
+        connected_ap_macs: set[str],
     ) -> None:
         link_up = client.get_port_link_status(port) is not False
         ap_mac = next((mac for mac in macs_on_port if mac in known_ap_macs), None)
-        desired = "trunk" if (link_up and ap_mac) else "onboarding"
 
         pvid = client.get_port_pvid(port)
         dot1x_disabled = client.get_dot1x_disabled(port)
         is_trunk = pvid == str(self.config.vlans.management) and dot1x_disabled is True
         current = "trunk" if is_trunk else "onboarding"
+
+        # Asymmetric desired computation - see module docstring for rationale.
+        if current == "trunk":
+            # Already trunked: stay trunked as long as the AP's MAC is present
+            # and the link is up.  UniFi's connected state is NOT checked here
+            # to avoid heartbeat-lag false reverts.
+            desired = "trunk" if (link_up and ap_mac) else "onboarding"
+        else:
+            # Not yet trunked: require UniFi to confirm the AP is connected
+            # (active management session) before opening the port.  This raises
+            # the bar for MAC spoofing without affecting normal AP boot time
+            # beyond the first trunk grant.
+            desired = "trunk" if (link_up and ap_mac and ap_mac in connected_ap_macs) else "onboarding"
+
         logger.debug(
-            "%s/%s: link_up=%s ap_mac=%s pvid=%s dot1x_disabled=%s current=%s desired=%s",
-            switch_name, port, link_up, ap_mac, pvid, dot1x_disabled, current, desired,
+            "%s/%s: link_up=%s ap_mac=%s connected=%s pvid=%s dot1x_disabled=%s current=%s desired=%s",
+            switch_name, port, link_up, ap_mac,
+            bool(ap_mac and ap_mac in connected_ap_macs),
+            pvid, dot1x_disabled, current, desired,
         )
         if current == desired:
             return
 
         if desired == "trunk":
-            logger.info("AP %s present on %s/%s -> trunk", ap_mac, switch_name, port)
+            logger.info("AP %s present and connected on %s/%s -> trunk", ap_mac, switch_name, port)
         elif not link_up:
             logger.info("%s/%s link down -> onboarding", switch_name, port)
         else:
