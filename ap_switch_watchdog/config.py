@@ -59,6 +59,7 @@ class WatchdogConfig:
     vlans: VlanConfig
     switches: list[SwitchConfig]
     netwatch: NetwatchConfig
+    trunk_grace_period: int = 120
 
 
 def _resolve_password(raw: dict, *, context: str) -> str:
@@ -126,6 +127,7 @@ def load_config(path: str | Path) -> WatchdogConfig:
 
         return WatchdogConfig(
             poll_interval=int(raw.get("poll_interval", 10)),
+            trunk_grace_period=int(raw.get("trunk_grace_period", 120)),
             unifi=unifi,
             vlans=vlans,
             switches=switches,

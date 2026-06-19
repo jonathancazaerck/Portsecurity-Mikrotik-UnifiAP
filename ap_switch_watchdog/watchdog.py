@@ -24,10 +24,20 @@ without reintroducing heartbeat-lag false reverts:
   access: the real AP would need to be simultaneously online, which would
   immediately displace it from the management VLAN and cause it to disconnect
   from the controller - making ``connected_macs`` go empty quickly.
-* **trunk → onboarding**: the known AP's MAC disappears from the bridge host
-  table *or* the link drops.  UniFi's ``connected`` state is deliberately
-  *not* checked here - heartbeat lag (30-70 s) would cause false reverts right
-  after every mode switch.
+* **trunk → onboarding**: any of the following:
+
+  - the known AP's MAC disappears from the bridge host table,
+  - the link drops,
+  - the AP has been absent from ``connected_macs`` for longer than
+    ``trunk_grace_period`` seconds (default 120 s) — within the grace window
+    ``connected_macs`` is not checked to avoid heartbeat-lag false reverts;
+    after the window a spoofer connecting after the real AP went offline is
+    detected,
+  - more than one MAC is seen on the management VLAN on this port (the bridge
+    external FDB), which indicates a hub, bridge, or second device behind the
+    port,
+  - PoE is no longer being drawn on the port (``poe-out-status ≠
+    "powered-on"``); checked only when a PoE entry exists for the port.
 
 The port's actual current mode is read live via ``MikroTikClient.get_port_pvid``
 and ``MikroTikClient.get_dot1x_disabled`` (PVID == management VLAN *and* dot1x
@@ -53,7 +63,7 @@ import time
 from typing import Optional
 
 from .config import SwitchConfig, WatchdogConfig
-from .mikrotik_client import MikroTikClient
+from .mikrotik_client import MikroTikClient, MikroTikConnectionError
 from .unifi_client import UniFiClient, UniFiError
 
 logger = logging.getLogger(__name__)
@@ -90,6 +100,14 @@ class APSwitchWatchdog:
                 for sw in config.switches
             }
         self._touched_ports: set[tuple[str, str]] = set()
+        # Per-port timestamp: last time the AP on this port was seen with an
+        # active UniFi management session.  Initialised to now so that ports
+        # already in trunk mode receive a full grace window on (re)start.
+        self._last_connected: dict[tuple[str, str], float] = {
+            (sw.name, port): time.monotonic()
+            for sw in config.switches
+            for port in sw.ap_ports
+        }
 
     def run_forever(self) -> None:
         while True:
@@ -113,8 +131,12 @@ class APSwitchWatchdog:
             client = self.switches[sw.name]
             try:
                 self._reconcile_switch(sw, client, known_ap_macs, connected_ap_macs, touched_last_cycle)
+            except MikroTikConnectionError as exc:
+                logger.warning("%s", exc)
+                client.close()
             except Exception:
                 logger.exception("failed to reconcile ports on %s", sw.name)
+                client.close()  # drop stale connection so the next cycle reconnects fresh
 
     def _reconcile_switch(
         self,
@@ -128,11 +150,18 @@ class APSwitchWatchdog:
         for mac, port in client.get_bridge_hosts().items():
             macs_by_port.setdefault(port, []).append(mac)
 
+        mgmt_macs_by_port = client.get_vlan_macs_by_port(self.config.vlans.management)
+
         for port in sw.ap_ports:
             if (sw.name, port) in touched_last_cycle:
                 continue
             try:
-                self._reconcile_port(sw.name, client, port, macs_by_port.get(port, []), known_ap_macs, connected_ap_macs)
+                self._reconcile_port(
+                    sw.name, client, port,
+                    macs_by_port.get(port, []),
+                    mgmt_macs_by_port.get(port, []),
+                    known_ap_macs, connected_ap_macs,
+                )
             except Exception:
                 logger.exception("failed to reconcile %s/%s", sw.name, port)
 
@@ -142,6 +171,7 @@ class APSwitchWatchdog:
         client: MikroTikClient,
         port: str,
         macs_on_port: list[str],
+        mgmt_macs_on_port: list[str],
         known_ap_macs: set[str],
         connected_ap_macs: set[str],
     ) -> None:
@@ -153,23 +183,53 @@ class APSwitchWatchdog:
         is_trunk = pvid == str(self.config.vlans.management) and dot1x_disabled is True
         current = "trunk" if is_trunk else "onboarding"
 
+        # Refresh the per-port "last seen connected" timestamp whenever UniFi
+        # confirms the AP has an active management session.
+        if ap_mac and ap_mac in connected_ap_macs:
+            self._last_connected[(switch_name, port)] = time.monotonic()
+
+        elapsed = time.monotonic() - self._last_connected.get((switch_name, port), 0.0)
+        grace_ok = elapsed <= self.config.trunk_grace_period
+
+        # More than one MAC on the management VLAN means a hub, bridge, or
+        # second device is behind the port.  Only checked on already-trunked
+        # ports: during onboarding the AP is still on the onboarding VLAN, so
+        # the management VLAN FDB will be empty and the check is meaningless.
+        single_mac_on_mgmt = len(mgmt_macs_on_port) <= 1
+
+        # PoE: "powered-on" means a device is actively drawing power.  If no
+        # PoE entry exists for the port (None), the check is skipped so that
+        # ports without PoE capability are not penalised.
+        poe_status = client.get_poe_out_status(port)
+        poe_active = poe_status == "powered-on" if poe_status is not None else True
+
         # Asymmetric desired computation - see module docstring for rationale.
         if current == "trunk":
-            # Already trunked: stay trunked as long as the AP's MAC is present
-            # and the link is up.  UniFi's connected state is NOT checked here
-            # to avoid heartbeat-lag false reverts.
-            desired = "trunk" if (link_up and ap_mac) else "onboarding"
+            # Within the grace window keep trunk without the connected check
+            # (avoids heartbeat-lag false reverts).  Once the grace window
+            # expires, require the AP to be connected — this is what catches
+            # a spoofer who connects after the real AP has gone offline.
+            desired = (
+                "trunk"
+                if (link_up and ap_mac and grace_ok and single_mac_on_mgmt and poe_active)
+                else "onboarding"
+            )
         else:
             # Not yet trunked: require UniFi to confirm the AP is connected
-            # (active management session) before opening the port.  This raises
-            # the bar for MAC spoofing without affecting normal AP boot time
-            # beyond the first trunk grant.
-            desired = "trunk" if (link_up and ap_mac and ap_mac in connected_ap_macs) else "onboarding"
+            # (active management session) and PoE is active before opening
+            # the port.  A device spoofing an AP MAC won't draw PoE.
+            desired = (
+                "trunk"
+                if (link_up and ap_mac and ap_mac in connected_ap_macs and poe_active)
+                else "onboarding"
+            )
 
         logger.debug(
-            "%s/%s: link_up=%s ap_mac=%s connected=%s pvid=%s dot1x_disabled=%s current=%s desired=%s",
+            "%s/%s: link_up=%s ap_mac=%s connected=%s grace_ok=%s "
+            "single_mac_on_mgmt=%s poe_status=%s pvid=%s dot1x_disabled=%s current=%s desired=%s",
             switch_name, port, link_up, ap_mac,
             bool(ap_mac and ap_mac in connected_ap_macs),
+            grace_ok, single_mac_on_mgmt, poe_status,
             pvid, dot1x_disabled, current, desired,
         )
         if current == desired:
@@ -179,8 +239,20 @@ class APSwitchWatchdog:
             logger.info("AP %s present and connected on %s/%s -> trunk", ap_mac, switch_name, port)
         elif not link_up:
             logger.info("%s/%s link down -> onboarding", switch_name, port)
-        else:
+        elif not ap_mac:
             logger.info("%s/%s no known AP present -> onboarding", switch_name, port)
+        elif not grace_ok:
+            logger.info(
+                "%s/%s AP %s absent from UniFi beyond grace period -> onboarding",
+                switch_name, port, ap_mac,
+            )
+        elif not single_mac_on_mgmt:
+            logger.info(
+                "%s/%s %d MACs on management VLAN (expected 1) -> onboarding",
+                switch_name, port, len(mgmt_macs_on_port),
+            )
+        else:
+            logger.info("%s/%s PoE not active (%s) -> onboarding", switch_name, port, poe_status)
 
         client.set_port_mode(port, desired, self.config.vlans)
         self._touched_ports.add((switch_name, port))

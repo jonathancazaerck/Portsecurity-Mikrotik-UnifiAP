@@ -5,21 +5,21 @@ port sits in an **onboarding VLAN** with **802.1X (dot1x) active** - it can't
 pass any traffic except EAPOL. Every poll cycle, the watchdog asks the switch
 which MAC addresses it currently sees on each `ap_port` (bridge host table +
 link state) and checks those against the UniFi controller's list of known AP
-MAC addresses. If a known AP is present and the port has link, the port
-becomes a **management+client trunk** with dot1x disabled. If not (AP
-unplugged, moved elsewhere, or no longer learned), the port is reverted to
-onboarding.
+MAC addresses. If all conditions are met the port becomes a **management+client
+trunk** with dot1x disabled. If not (AP unplugged, moved elsewhere, MAC
+disappeared, or the checks fail), the port is reverted to onboarding.
 
 ```
         UniFi controller                    MikroTik switch
    "which MACs are known APs?"        bridge host table, link state,
-      (poll every poll_interval)         PVID, dot1x (same interval)
+   "which are currently connected?"   PVID, dot1x, PoE status
+      (poll every poll_interval)         (same interval)
               │                                     │
               └──────────────────┬──────────────────┘
                                   ▼
                        ┌──────────────────┐
-                       │  ap-switch-       │  per ap_port: known AP's MAC
-                       │  watchdog         │  present AND link up?
+                       │  ap-switch-       │  per ap_port: all checks pass?
+                       │  watchdog         │
                        └──────────────────┘
                                   │ RouterOS API (SSL, 8729)
                                   ▼
@@ -41,8 +41,8 @@ onboarding.
 ```
 ap_switch_watchdog/
   config.py          # YAML config loading, passwords from env vars
-  unifi_client.py     # UniFi controller: which MAC addresses are known APs?
-  mikrotik_client.py  # RouterOS API: bridge host table, link/PVID/dot1x, mode switching
+  unifi_client.py     # UniFi controller: known + connected AP MAC addresses
+  mikrotik_client.py  # RouterOS API: bridge host table, link/PVID/dot1x/PoE, mode switching
   port_lists.py       # helpers for "tagged"/"untagged" comma-separated port lists
   routeros_script.py  # generates the on-switch failsafe revert script (RSC)
   watchdog.py         # main reconciliation loop
@@ -70,6 +70,10 @@ appending entries to the `switches:` list - each needs its own
 
 `vlans.onboarding` / `management` / `trunk` apply to **every** switch, so all
 switches must share the same VLAN numbering.
+
+`trunk_grace_period` (default 120 s) controls how long a trunked port is kept
+open after its AP's UniFi management session disappears - see "Anti-MAC-spoofing
+checks" below.
 
 ## Setup (run once per switch, and again whenever `ap_ports`/VLANs change)
 
@@ -115,21 +119,21 @@ Every `poll_interval` seconds, for each switch:
 
 1. Fetch the bridge host table (`/interface/bridge/host`) once, building a
    `port -> [MACs]` map of what the switch currently sees on each `ap_port`.
+   Also fetch the host table filtered to the management VLAN to count external
+   (non-local) MACs per port.
 2. Fetch the set of MAC addresses UniFi knows about as access points
-   (`stat/device`, `type == "uap"`) - **regardless of their reported
-   online/offline `state`**, see "Why not poll AP online/offline state?"
-   below.
-3. For each `ap_port`, compute:
-   - **link up?** - `/interface` `running`.
-   - **known AP present?** - any MAC the bridge has learned on this port
-     that's also in UniFi's known-AP set.
-   - **desired mode** = `trunk` if both are true, else `onboarding`.
+   (`stat/device`, `type == "uap"`), split into two sets:
+   - `known_macs` - every ever-adopted AP MAC, regardless of online/offline state.
+   - `connected_macs` - subset where the AP currently has an active management
+     session with the controller (`state == 1`).
+3. For each `ap_port`, compute the **desired mode** using an asymmetric rule
+   (see "Anti-MAC-spoofing checks" below).
 4. Compare against the port's **actual** current mode, read live from the
    switch (PVID == management VLAN *and* dot1x disabled => `trunk`,
    otherwise `onboarding`). If actual != desired, `set_port_mode` applies the
-   VLAN/dot1x change for the new mode - dot1x disabled *last* when opening a
-   port, re-enabled *first* when locking it down - and flaps the port (see
-   "Port flap on mode change" below).
+   VLAN/dot1x change - dot1x disabled *last* when opening a port, re-enabled
+   *first* when locking it down - and flaps the port (see "Port flap on mode
+   change" below).
 
 Ports changed this cycle are skipped on the *next* poll, giving the link and
 bridge host table one `poll_interval` to settle after the flap before being
@@ -139,25 +143,51 @@ There is **no persisted state** - every poll fully reconciles each port from
 live switch + UniFi data, so a restart picks up exactly where the switches
 currently are.
 
-### Why not poll AP online/offline state?
+### Anti-MAC-spoofing checks
 
-UniFi's per-device `state` field (online/offline) is heartbeat-based and can
-lag 30-70+ seconds behind reality - especially right after a VLAN change,
-when the AP briefly loses and regains its management-plane connection to the
-controller while it picks up an address on the new VLAN. Earlier versions of
-this watchdog used that field as the trigger for trunk/onboarding, with
-`offline_debounce` and a separate link-down "fast path" layered on top to
-paper over its lag and the false "offline" blips it produced right after
-every mode switch - each fix narrowed the false-revert window but never
-closed it.
+The desired mode is computed using an **asymmetric rule** that closes the
+MAC-spoofing window without reintroducing heartbeat-lag false reverts:
 
-Instead, "is a known AP physically present on this port right now" is
-answered entirely from the switch's own bridge host table and link state,
-which RouterOS updates essentially instantly and aren't affected by the
-controller's heartbeat timing at all. UniFi is only used as a
-slowly-changing **allowlist** of known AP MAC addresses - the security
-question "is this device allowed a trunk", not "is it online right now" - so
-its heartbeat lag no longer matters.
+**onboarding → trunk** requires ALL of:
+- Link up (`/interface running`).
+- A `known_macs` AP MAC learned on this port by the bridge.
+- That MAC also in `connected_macs` (active UniFi management session). A device
+  spoofing the MAC of a registered-but-offline AP is not granted trunk access -
+  the real AP would need to be simultaneously online, which is impossible to
+  fake without access to the controller.
+- PoE `powered-on` on the port (if the switch reports PoE status). A laptop or
+  other non-PoE device spoofing an AP MAC will not draw PoE power.
+
+**trunk → onboarding** triggers on ANY of:
+- Link drops.
+- The AP's MAC disappears from the bridge host table (AP rebooted, unplugged,
+  moved).
+- More than one **external** (non-local) MAC visible on the management VLAN on
+  this port - indicates a hub, bridge, or second device behind the port.
+- PoE is no longer `powered-on` (if reported by the switch).
+- The AP has been absent from `connected_macs` for longer than
+  `trunk_grace_period` seconds (default 120 s). Within the grace window the
+  connected check is deliberately skipped to absorb the 30-70 s UniFi
+  heartbeat gap that occurs right after every mode switch. Once the window
+  expires a device that assumed a known AP's MAC while the real AP was offline
+  is detected and the port is reverted.
+
+### Why the onboarding → trunk transition checks `connected_macs`
+
+UniFi's per-device `state` field (connected/disconnected) is heartbeat-based
+and can lag 30-70+ seconds behind reality. This matters in two different ways:
+
+- **For granting trunk** (`onboarding → trunk`): the lag is acceptable. A real
+  AP will be seen as connected within seconds of its first poll after booting,
+  and the lag only adds a brief delay to the first trunk grant after a cold
+  boot - it doesn't cause a false deny.
+- **For keeping trunk** (`trunk → onboarding`): the lag causes false reverts.
+  Right after every mode switch the AP's management-plane connection briefly
+  drops while it picks up a new IP on the new VLAN. If `connected_macs` were
+  checked here too, the port would bounce back to onboarding before the AP
+  finishes reconnecting. The grace window absorbs this: within `trunk_grace_period`
+  seconds the connected check is skipped; after it, the check is re-applied as
+  a late-stage MAC-spoofing defence.
 
 ### Port flap on mode change
 
@@ -165,7 +195,7 @@ Changing a live port's PVID/VLAN membership does not produce a link-down
 event on RouterOS, so a connected AP can keep using its old (now invalid) IP
 on the wrong VLAN until its lease/heartbeat timeout expires. To avoid this,
 `MikroTikClient.flap_port` briefly disables and re-enables the port's
-`/interface` entry after every mode switch (disable, wait ~2s, re-enable), so
+`/interface` entry after every mode switch (disable, wait ~2 s, re-enable), so
 the AP's NIC sees a link-down/link-up event and renews its IP immediately on
 the new VLAN.
 
@@ -221,19 +251,26 @@ real sw01). Before relying on it in production, verify on RouterOS 7.x:
   the reconciliation loop relies on to ever decide a port should become a
   trunk in the first place - if an AP's MAC never appears in the bridge host
   table before its port is trunked, the port will never leave onboarding.
+- **`/interface/bridge/host` field names** - `mac-address`, `on-interface`,
+  `bridge`, `vid` (VLAN ID, present when `vlan-filtering=yes` on the bridge),
+  `local` (`"true"` for the bridge's own MAC, `"false"` for externally learned
+  MACs). Run `/interface/bridge/host print` via the API and confirm these
+  fields are present and match the expected values.
 - **`/interface/dot1x/server`** - the resource path for bridge-port 802.1X
   authenticator entries (confirmed against MikroTik's official docs:
   `/interface dot1x server`, *not* `/interface/dot1x-server`). If a future
   RouterOS release moves it again, update `MikroTikClient.DOT1X_SERVER_PATH`
   in `ap_switch_watchdog/mikrotik_client.py` and the matching line in
   `ap_switch_watchdog/routeros_script.py`.
-- **`/interface/bridge/host` field names** - `mac-address`, `on-interface`,
-  `bridge`. Run `/interface/bridge/host print` via the API and compare.
 - **`/interface` `running` field** - used by `flap_port` (to find the
   interface by `name`) and `get_port_link_status` (the per-poll link check).
   Run `/interface print` via the API for one of your `ap_ports` and confirm
   it returns a `running` property (`"true"`/`"false"`) reflecting physical
   link state.
+- **`/interface/ethernet/poe` field names** - `interface`, `poe-out-status`
+  (values include `"powered-on"`, `"waiting-for-load"`, `"off"`). If a port
+  has no PoE entry the check is silently skipped. Run
+  `/interface/ethernet/poe print` to inspect what your switch reports.
 - **`(R/M)STP` on the bridge** - MikroTik docs note dot1x-protected ports
   need the bridge running (R/M)STP for EAPOL to be handled correctly.
 - **Failsafe RSC script syntax** (`ap_switch_watchdog/routeros_script.py`) -

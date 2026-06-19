@@ -1,6 +1,7 @@
 import pytest
 
 from ap_switch_watchdog.config import NetwatchConfig, SwitchConfig, UniFiConfig, VlanConfig, WatchdogConfig
+from ap_switch_watchdog.mikrotik_client import MikroTikConnectionError
 from ap_switch_watchdog.unifi_client import UniFiError
 from ap_switch_watchdog.watchdog import APSwitchWatchdog
 from tests.conftest import make_client, seed_baseline
@@ -287,6 +288,37 @@ def test_bridge_host_query_failure_skips_switch(config, sw01, vlans):
     assert _port(db, "ether2")["pvid"] == str(vlans.onboarding)
 
 
+def test_connection_error_logs_warning_and_resets_client(config, sw01, vlans):
+    db, client = sw01
+    _ = client.api  # cache a connection
+
+    client.get_bridge_hosts = lambda: (_ for _ in ()).throw(
+        MikroTikConnectionError("sw01: cannot connect to 192.0.2.2: [Errno 113] No route to host")
+    )
+    wd, unifi = make_watchdog(config, client, {AP1})
+
+    wd.poll_once()  # must not raise
+
+    assert client._api is None  # connection was reset for the next cycle
+
+
+def test_switch_connection_is_reset_after_failure(config, sw01, vlans):
+    db, client = sw01
+    # Pre-establish the cached API connection.
+    _ = client.api
+    assert client._api is not None
+
+    # Simulate a mid-poll connection drop (e.g. RouterOsApiConnectionError).
+    client.get_bridge_hosts = lambda: (_ for _ in ()).throw(RuntimeError("connection lost"))
+    wd, unifi = make_watchdog(config, client, {AP1})
+
+    wd.poll_once()  # must not raise
+
+    # The stale connection must be reset so the next cycle can reconnect fresh
+    # instead of reusing the broken socket and triggering an infinite error loop.
+    assert client._api is None
+
+
 # -- anti-spoofing: onboarding -> trunk requires UniFi connected ---------------
 
 
@@ -312,10 +344,131 @@ def test_trunked_port_stays_trunked_when_ap_drops_from_unifi(config, sw01, vlans
     # AP temporarily loses its UniFi management session (heartbeat lag,
     # brief controller outage, VLAN change settling ...) while the MAC is
     # still in the bridge host table and the link is still up.
-    # The port must stay in trunk - this is the core protection against
-    # heartbeat-lag false reverts.
+    # The port must stay in trunk within the grace window.
     unifi.connected_macs = set()
     wd.poll_once()
 
     assert _port(db, "ether2")["pvid"] == str(vlans.management)
     assert _dot1x(db, "ether2")["disabled"] == "yes"
+
+
+# -- PoE check: onboarding -> trunk requires PoE active ---------------------------
+
+
+def test_no_poe_blocks_trunk_grant(config, sw01, vlans):
+    db, client = sw01
+    # Simulate no PoE draw on ether2 (e.g. a laptop with spoofed MAC).
+    next(e for e in db["/interface/ethernet/poe"] if e["interface"] == "ether2")["poe-out-status"] = "waiting-for-load"
+    wd, unifi = make_watchdog(config, client, {AP1})
+
+    wd.poll_once()
+
+    assert _port(db, "ether2")["pvid"] == str(vlans.onboarding)
+    assert _dot1x(db, "ether2")["disabled"] == "no"
+
+
+def test_poe_unavailable_does_not_block_trunk_grant(config, sw01, vlans):
+    db, client = sw01
+    # Remove the PoE entry entirely — port has no PoE capability.
+    db["/interface/ethernet/poe"] = [e for e in db["/interface/ethernet/poe"] if e["interface"] != "ether2"]
+    wd, unifi = make_watchdog(config, client, {AP1})
+
+    wd.poll_once()
+
+    assert _port(db, "ether2")["pvid"] == str(vlans.management)
+    assert _dot1x(db, "ether2")["disabled"] == "yes"
+
+
+# -- PoE check: trunk -> onboarding when PoE drops --------------------------------
+
+
+def test_poe_loss_reverts_trunked_port(config, sw01, vlans):
+    db, client = sw01
+    wd, unifi = make_watchdog(config, client, {AP1})
+    wd.poll_once()  # AP1 connected, PoE active -> trunk (touched)
+    wd.poll_once()  # settle cycle
+
+    # PoE draw stops (e.g. AP powered externally and physical AP removed but
+    # link somehow stays up via a passive PoE adapter).
+    next(e for e in db["/interface/ethernet/poe"] if e["interface"] == "ether2")["poe-out-status"] = "waiting-for-load"
+    wd.poll_once()
+
+    assert _port(db, "ether2")["pvid"] == str(vlans.onboarding)
+    assert _dot1x(db, "ether2")["disabled"] == "no"
+
+
+# -- management VLAN MAC count check: trunk -> onboarding -------------------------
+
+
+def test_multiple_macs_on_mgmt_vlan_reverts_trunked_port(config, sw01, vlans):
+    db, client = sw01
+    wd, unifi = make_watchdog(config, client, {AP1})
+    wd.poll_once()  # AP1 -> trunk (touched)
+    wd.poll_once()  # settle cycle
+
+    # A second device appears on the management VLAN on the same port
+    # (hub or bridge behind the AP port).
+    db["/interface/bridge/host"].append(
+        {"id": "*h9", "bridge": "bridge1", "mac-address": "de:ad:be:ef:00:01",
+         "on-interface": "ether2", "vid": str(vlans.management)}
+    )
+    db["/interface/bridge/host"].append(
+        {"id": "*h10", "bridge": "bridge1", "mac-address": AP1,
+         "on-interface": "ether2", "vid": str(vlans.management)}
+    )
+    wd.poll_once()
+
+    assert _port(db, "ether2")["pvid"] == str(vlans.onboarding)
+    assert _dot1x(db, "ether2")["disabled"] == "no"
+
+
+def test_single_mac_on_mgmt_vlan_stays_trunked(config, sw01, vlans):
+    db, client = sw01
+    wd, unifi = make_watchdog(config, client, {AP1})
+    wd.poll_once()  # trunk (touched)
+    wd.poll_once()  # settle cycle
+
+    # AP's MAC on management VLAN plus the bridge's own local MAC (flag L in
+    # the CLI, local=true in the API) — the local entry must be excluded so
+    # the count stays at 1.
+    db["/interface/bridge/host"].append(
+        {"id": "*h9", "bridge": "bridge1", "mac-address": AP1,
+         "on-interface": "ether2", "vid": str(vlans.management), "local": "false"}
+    )
+    db["/interface/bridge/host"].append(
+        {"id": "*h10", "bridge": "bridge1", "mac-address": "cc:cc:cc:cc:cc:cc",
+         "on-interface": "ether2", "vid": str(vlans.management), "local": "true"}
+    )
+    wd.poll_once()
+
+    assert _port(db, "ether2")["pvid"] == str(vlans.management)
+    assert _dot1x(db, "ether2")["disabled"] == "yes"
+
+
+# -- grace period expiry (moved here for grouping) ---------------------------------
+
+
+def test_trunked_port_reverts_after_grace_period_expires(config, sw01, vlans):
+    db, client = sw01
+    # Zero-second grace period: any elapsed time counts as expired.
+    zero_grace_config = WatchdogConfig(
+        poll_interval=config.poll_interval,
+        trunk_grace_period=0,
+        unifi=config.unifi,
+        vlans=config.vlans,
+        switches=config.switches,
+        netwatch=config.netwatch,
+    )
+    wd, unifi = make_watchdog(zero_grace_config, client, {AP1})
+    wd.poll_once()  # AP1 connected -> trunk (touched)
+    wd.poll_once()  # settle cycle
+
+    # AP loses its UniFi management session and the grace period (0 s) is
+    # already expired by the time the next poll runs.  The trunked port must
+    # be reverted to onboarding - this is the MAC-spoofing defence for the
+    # case where the real AP has gone offline.
+    unifi.connected_macs = set()
+    wd.poll_once()
+
+    assert _port(db, "ether2")["pvid"] == str(vlans.onboarding)
+    assert _dot1x(db, "ether2")["disabled"] == "no"

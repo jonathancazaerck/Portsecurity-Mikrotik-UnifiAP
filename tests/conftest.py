@@ -129,6 +129,10 @@ def seed_baseline(db: dict[str, list[dict]], switch: SwitchConfig, vlans: VlanCo
     for port in switch.ap_ports:
         interface_table.append({"id": f"*{next(counter)}", "name": port, "disabled": "no", "running": "true"})
 
+    poe_table = db.setdefault("/interface/ethernet/poe", [])
+    for port in switch.ap_ports:
+        poe_table.append({"id": f"*{next(counter)}", "interface": port, "poe-out": "auto-on", "poe-out-status": "powered-on"})
+
 
 def make_client(
     db: dict[str, list[dict]] | None = None,

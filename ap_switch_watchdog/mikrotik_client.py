@@ -33,7 +33,8 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Callable, Optional
+from contextlib import contextmanager
+from typing import Callable, Generator, Optional
 
 import routeros_api
 
@@ -47,6 +48,10 @@ PoolFactory = Callable[[], "routeros_api.RouterOsApiPool"]
 
 class MikroTikError(Exception):
     """Base class for MikroTik client errors."""
+
+
+class MikroTikConnectionError(MikroTikError):
+    """Raised when the switch is unreachable or the API connection drops."""
 
 
 class PortNotFoundError(MikroTikError):
@@ -74,6 +79,7 @@ class MikroTikClient:
     BRIDGE_PORT_PATH = "/interface/bridge/port"
     BRIDGE_HOST_PATH = "/interface/bridge/host"
     DOT1X_SERVER_PATH = "/interface/dot1x/server"
+    ETHERNET_POE_PATH = "/interface/ethernet/poe"
     INTERFACE_PATH = "/interface"
     SCRIPT_PATH = "/system/script"
     NETWATCH_PATH = "/tool/netwatch"
@@ -122,11 +128,25 @@ class MikroTikClient:
 
     # -- connection management -------------------------------------------------
 
+    @contextmanager
+    def _connection_guard(self) -> Generator[None, None, None]:
+        """Convert any RouterOsApiConnectionError to MikroTikConnectionError.
+
+        Wraps both connection setup and mid-operation failures (timeouts, dropped
+        sockets) so callers only need to handle one exception type.
+        """
+        try:
+            yield
+        except routeros_api.exceptions.RouterOsApiConnectionError as exc:
+            self.close()
+            raise MikroTikConnectionError(f"{self.name}: {exc}") from exc
+
     def connect(self):
         if self._api is None:
             logger.debug("%s: connecting to %s:%s", self.name, self.host, self._port)
-            self._pool = self._pool_factory()
-            self._api = self._pool.get_api()
+            with self._connection_guard():
+                self._pool = self._pool_factory()
+                self._api = self._pool.get_api()
         return self._api
 
     def close(self) -> None:
@@ -155,31 +175,77 @@ class MikroTikClient:
         so callers should fetch this once per poll cycle rather than calling
         :meth:`find_port_by_mac` per AP.
         """
-        hosts = self.api.get_resource(self.BRIDGE_HOST_PATH)
-        result: dict[str, str] = {}
-        for entry in hosts.get():
-            if entry.get("bridge") and entry["bridge"] != self.bridge:
-                continue
-            mac = entry.get("mac-address")
-            on_interface = entry.get("on-interface")
-            if mac and on_interface:
-                result.setdefault(mac.lower(), on_interface)
-        return result
+        with self._connection_guard():
+            hosts = self.api.get_resource(self.BRIDGE_HOST_PATH)
+            result: dict[str, str] = {}
+            for entry in hosts.get():
+                if entry.get("bridge") and entry["bridge"] != self.bridge:
+                    continue
+                mac = entry.get("mac-address")
+                on_interface = entry.get("on-interface")
+                if mac and on_interface:
+                    result.setdefault(mac.lower(), on_interface)
+            return result
 
     def find_port_by_mac(self, mac: str) -> Optional[str]:
         """Return the bridge port name a MAC address was learned on, if any."""
         return self.get_bridge_hosts().get(mac.lower())
 
+    def get_vlan_macs_by_port(self, vlan_id: int) -> dict[str, list[str]]:
+        """Return ``{port: [mac, ...]}`` for **external** MACs on ``vlan_id``.
+
+        Only entries with ``local != "true"`` are counted — the bridge's own
+        MAC (flag ``L`` in the CLI) also appears in the host table on the
+        management VLAN but is not a client device and must be excluded.
+        Uses the ``vid`` field present when VLAN filtering is enabled on the
+        bridge; entries without a ``vid`` field are silently skipped.
+        """
+        with self._connection_guard():
+            hosts = self.api.get_resource(self.BRIDGE_HOST_PATH)
+            result: dict[str, list[str]] = {}
+            for entry in hosts.get():
+                if entry.get("bridge") and entry["bridge"] != self.bridge:
+                    continue
+                if entry.get("local") == "true":
+                    continue
+                if entry.get("vid") != str(vlan_id):
+                    continue
+                mac = entry.get("mac-address")
+                on_interface = entry.get("on-interface")
+                if mac and on_interface:
+                    result.setdefault(on_interface, []).append(mac.lower())
+            return result
+
+    def get_poe_out_status(self, port: str) -> Optional[str]:
+        """Return the ``poe-out-status`` string for ``port``, or ``None`` if unavailable.
+
+        ``None`` means the switch has no PoE entry for this port or the path is
+        unsupported — callers skip the PoE check in that case.
+        ``MikroTikConnectionError`` is re-raised so the poll cycle is aborted.
+        """
+        try:
+            with self._connection_guard():
+                poe = self.api.get_resource(self.ETHERNET_POE_PATH)
+                entries = poe.get(interface=port)
+        except MikroTikConnectionError:
+            raise
+        except Exception:
+            return None
+        if not entries:
+            return None
+        return entries[0].get("poe-out-status")
+
     # -- port mode switching -------------------------------------------------------
 
     def set_port_mode(self, port: str, mode: str, vlans: VlanConfig) -> None:
         """Switch ``port`` into ``"trunk"`` or ``"onboarding"`` mode."""
-        if mode == "trunk":
-            self._apply_trunk(port, vlans)
-        elif mode == "onboarding":
-            self._apply_onboarding(port, vlans)
-        else:
-            raise ValueError(f"unknown port mode: {mode!r}")
+        with self._connection_guard():
+            if mode == "trunk":
+                self._apply_trunk(port, vlans)
+            elif mode == "onboarding":
+                self._apply_onboarding(port, vlans)
+            else:
+                raise ValueError(f"unknown port mode: {mode!r}")
 
     def _apply_trunk(self, port: str, vlans: VlanConfig) -> None:
         """AP came online: open the port up for management + client VLANs.
@@ -241,11 +307,12 @@ class MikroTikClient:
         (which can take tens of seconds), this reflects the switch's own
         link state and is effectively instant.
         """
-        interfaces = self.api.get_resource(self.INTERFACE_PATH)
-        entries = interfaces.get(name=port)
-        if not entries:
-            return None
-        return entries[0].get("running") == "true"
+        with self._connection_guard():
+            interfaces = self.api.get_resource(self.INTERFACE_PATH)
+            entries = interfaces.get(name=port)
+            if not entries:
+                return None
+            return entries[0].get("running") == "true"
 
     # -- bridge port / VLAN table helpers -------------------------------------------
 
@@ -312,11 +379,12 @@ class MikroTikClient:
         accepted here. Returns ``None`` if no ``/interface/dot1x/server``
         entry exists for ``port``.
         """
-        dot1x = self.api.get_resource(self.DOT1X_SERVER_PATH)
-        entries = dot1x.get(interface=port)
-        if not entries:
-            return None
-        return entries[0].get("disabled") in ("yes", "true")
+        with self._connection_guard():
+            dot1x = self.api.get_resource(self.DOT1X_SERVER_PATH)
+            entries = dot1x.get(interface=port)
+            if not entries:
+                return None
+            return entries[0].get("disabled") in ("yes", "true")
 
     # -- setup helpers (used by scripts/setup_switches.py) ----------------------------
 
@@ -392,8 +460,9 @@ class MikroTikClient:
 
     def get_port_pvid(self, port: str) -> Optional[str]:
         """Return the current PVID of ``port``, or ``None`` if not found."""
-        ports = self.api.get_resource(self.BRIDGE_PORT_PATH)
-        for entry in ports.get(interface=port):
-            if entry.get("bridge") == self.bridge:
-                return entry.get("pvid")
-        return None
+        with self._connection_guard():
+            ports = self.api.get_resource(self.BRIDGE_PORT_PATH)
+            for entry in ports.get(interface=port):
+                if entry.get("bridge") == self.bridge:
+                    return entry.get("pvid")
+            return None

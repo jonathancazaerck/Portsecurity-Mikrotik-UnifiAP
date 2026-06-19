@@ -54,6 +54,7 @@ def test_load_config(config_path):
     assert sw.ap_ports == ["ether2", "ether3"]
 
     assert config.netwatch.watchdog_host == "192.0.2.10"
+    assert config.trunk_grace_period == 120  # default
 
 
 def test_missing_env_var_raises(tmp_path, monkeypatch):

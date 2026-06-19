@@ -7,6 +7,14 @@
 # controller only supplies the list of known AP MAC addresses.
 poll_interval: 5
 
+# Grace window (seconds) before a trunked port is reverted to onboarding when
+# the AP loses its UniFi management session.  The window must be long enough
+# to absorb the UniFi heartbeat lag (typically 30-70 s) so that brief
+# controller hiccups don't cause false reverts.  Once it expires, the port is
+# reverted even if the AP's MAC is still in the bridge host table, which
+# catches MAC-spoofing attacks after the real AP has gone offline.
+trunk_grace_period: 120
+
 unifi:
   url: "https://192.0.2.1"
   username: "watchdog"
