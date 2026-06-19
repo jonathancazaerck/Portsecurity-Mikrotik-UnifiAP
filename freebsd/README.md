@@ -9,6 +9,17 @@ It installs `ap-switch-watchdog` and its Python dependencies into a private
 virtualenv under `${PREFIX}/libexec/ap-switch-watchdog/venv` (default
 `PREFIX=/usr/local`), so it doesn't touch the system's `pkg`-managed Python.
 
+## Prerequisites
+
+Python 3 is not installed by default on FreeBSD:
+
+```sh
+pkg install python3
+```
+
+For a specific version (e.g. 3.11): `pkg install python311` and then pass
+`PYTHON=python3.11` to every `make` call below.
+
 ## Install
 
 Copy this whole repository to the FreeBSD server (`git clone`, `rsync`, ...),
