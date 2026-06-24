@@ -108,6 +108,9 @@ class APSwitchWatchdog:
             for sw in config.switches
             for port in sw.ap_ports
         }
+        # Track connectivity state so we can log restoration after an outage.
+        self._unifi_down: bool = False
+        self._switches_down: set[str] = set()
 
     def run_forever(self) -> None:
         while True:
@@ -124,8 +127,14 @@ class APSwitchWatchdog:
         try:
             known_ap_macs, connected_ap_macs = self.unifi.get_ap_macs()
         except Exception as exc:
+            if not self._unifi_down:
+                self._unifi_down = True
             logger.warning("failed to query UniFi controller: %s — skipping cycle", exc)
             return
+
+        if self._unifi_down:
+            self._unifi_down = False
+            logger.info("UniFi controller connection restored")
 
         touched_last_cycle = self._touched_ports
         self._touched_ports = set()
@@ -134,10 +143,17 @@ class APSwitchWatchdog:
             client = self.switches[sw.name]
             try:
                 self._reconcile_switch(sw, client, known_ap_macs, connected_ap_macs, touched_last_cycle)
+                if sw.name in self._switches_down:
+                    self._switches_down.discard(sw.name)
+                    logger.info("%s: connection restored", sw.name)
             except MikroTikConnectionError as exc:
+                if sw.name not in self._switches_down:
+                    self._switches_down.add(sw.name)
                 logger.warning("%s", exc)
                 client.close()
             except Exception:
+                if sw.name not in self._switches_down:
+                    self._switches_down.add(sw.name)
                 logger.exception("failed to reconcile ports on %s", sw.name)
                 client.close()  # drop stale connection so the next cycle reconnects fresh
 
