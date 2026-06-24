@@ -251,6 +251,14 @@ class APSwitchWatchdog:
             grace_ok, single_mac_on_mgmt, poe_status,
             pvid, dot1x_disabled, current, desired,
         )
+        logger.info(
+            "%s/%s  mode=%-12s  ap=%-17s  link=%-4s  connected=%-3s  poe=%s",
+            switch_name, port, current,
+            ap_mac or "—",
+            "up" if link_up else "down",
+            "yes" if (ap_mac and ap_mac in connected_ap_macs) else "no",
+            poe_status or "n/a",
+        )
         if current == desired:
             return
 
