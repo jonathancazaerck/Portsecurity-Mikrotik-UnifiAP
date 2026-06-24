@@ -231,11 +231,16 @@ class MikroTikClient:
                 entries = poe.get(interface=port)
         except MikroTikConnectionError:
             raise
-        except Exception:
+        except Exception as exc:
+            logger.debug("%s: PoE query for %s failed: %s", self.name, port, exc)
             return None
         if not entries:
+            logger.debug("%s: no PoE entry found for %s", self.name, port)
             return None
-        return entries[0].get("poe-out-status")
+        status = entries[0].get("poe-out-status")
+        if status is None:
+            logger.debug("%s: PoE entry for %s has no poe-out-status field: %s", self.name, port, entries[0])
+        return status
 
     # -- port mode switching -------------------------------------------------------
 
