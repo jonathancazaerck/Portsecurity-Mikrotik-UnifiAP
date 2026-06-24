@@ -181,6 +181,8 @@ class APSwitchWatchdog:
                     mgmt_macs_by_port.get(port, []),
                     known_ap_macs, connected_ap_macs,
                 )
+            except MikroTikConnectionError:
+                raise  # abort the whole switch so poll_once can close + reset the client
             except Exception:
                 logger.exception("failed to reconcile %s/%s", sw.name, port)
 

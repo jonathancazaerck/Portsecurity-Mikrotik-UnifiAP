@@ -150,10 +150,12 @@ class MikroTikClient:
         return self._api
 
     def close(self) -> None:
-        if self._pool is not None:
-            self._pool.disconnect()
-        self._pool = None
-        self._api = None
+        try:
+            if self._pool is not None:
+                self._pool.disconnect()
+        finally:
+            self._pool = None
+            self._api = None
 
     def __enter__(self) -> "MikroTikClient":
         self.connect()
