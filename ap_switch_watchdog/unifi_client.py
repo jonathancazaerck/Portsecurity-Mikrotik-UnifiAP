@@ -122,21 +122,47 @@ class UniFiClient:
                 connected.add(mac)
         return known, connected
 
+    def _get(self, url: str) -> requests.Response:
+        try:
+            return self.session.get(url, timeout=self.timeout)
+        except requests.RequestException as exc:
+            raise UniFiError(f"request to {url} failed: {exc}") from exc
+
     def _get_devices(self) -> list[dict]:
         if self._api_prefix is None:
             self.login()
 
         url = f"{self.base_url}{self._api_prefix}/api/s/{self.site}/stat/device"
-        resp = self.session.get(url, timeout=self.timeout)
+        resp = self._get(url)
         if resp.status_code == 401:
             # Session expired - log in again and retry once.
             self.login()
             url = f"{self.base_url}{self._api_prefix}/api/s/{self.site}/stat/device"
-            resp = self.session.get(url, timeout=self.timeout)
+            resp = self._get(url)
+
+        if resp.status_code == 404:
+            # Newer standalone Network Application also accepts /api/auth/login,
+            # so the prefix auto-detection can misidentify it as UniFi OS.
+            # Try the other prefix once to self-correct.
+            other_prefix = "" if self._api_prefix == "/proxy/network" else "/proxy/network"
+            alt_url = f"{self.base_url}{other_prefix}/api/s/{self.site}/stat/device"
+            try:
+                alt_resp = self._get(alt_url)
+            except UniFiError:
+                alt_resp = None
+            if alt_resp is not None and alt_resp.status_code == 200:
+                logger.debug(
+                    "auto-corrected API prefix from %r to %r",
+                    self._api_prefix,
+                    other_prefix,
+                )
+                self._api_prefix = other_prefix
+                return alt_resp.json().get("data", [])
 
         if resp.status_code != 200:
             raise UniFiError(
                 f"fetching devices from {self.base_url} failed with HTTP {resp.status_code}"
+                f" (site={self.site!r}; check site name in config)"
             )
 
         return resp.json().get("data", [])

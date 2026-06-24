@@ -114,14 +114,17 @@ class APSwitchWatchdog:
             try:
                 self.poll_once()
             except Exception:
-                logger.exception("poll cycle failed")
-            time.sleep(self.config.poll_interval)
+                logger.exception("unexpected error in poll cycle — continuing")
+            try:
+                time.sleep(self.config.poll_interval)
+            except Exception:
+                pass
 
     def poll_once(self) -> None:
         try:
             known_ap_macs, connected_ap_macs = self.unifi.get_ap_macs()
-        except UniFiError:
-            logger.exception("failed to query UniFi controller")
+        except Exception as exc:
+            logger.warning("failed to query UniFi controller: %s — skipping cycle", exc)
             return
 
         touched_last_cycle = self._touched_ports
