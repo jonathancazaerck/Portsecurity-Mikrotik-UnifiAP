@@ -25,8 +25,12 @@ logger = logging.getLogger(__name__)
 
 # Device "type" reported by the controller for UniFi access points.
 AP_DEVICE_TYPE = "uap"
-# ``state`` value indicating the AP has an active management session.
-STATE_CONNECTED = 1
+# ``state`` values that count as "managed by this controller".
+# 1 = connected, 5 = provisioning (controller is actively pushing config).
+# Both are sufficient for the trunk grant: the AP is adopted, present, and
+# drawing PoE — a spoofer cannot replicate that without the real AP also
+# talking to the controller simultaneously.
+STATES_MANAGED = {1, 5}
 
 
 class UniFiError(Exception):
@@ -118,7 +122,7 @@ class UniFiClient:
                 continue
             mac = mac.lower()
             known.add(mac)
-            if device.get("state") == STATE_CONNECTED:
+            if device.get("state") in STATES_MANAGED:
                 connected.add(mac)
         return known, connected
 
