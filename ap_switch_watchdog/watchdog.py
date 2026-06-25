@@ -223,11 +223,14 @@ class APSwitchWatchdog:
         # the management VLAN FDB will be empty and the check is meaningless.
         single_mac_on_mgmt = len(mgmt_macs_on_port) <= 1
 
-        # PoE: "powered-on" means a device is actively drawing power.  If no
-        # PoE entry exists for the port (None), the check is skipped so that
-        # ports without PoE capability are not penalised.
+        # PoE: block only when the switch explicitly reports "powered-off" —
+        # meaning PoE is configured but nothing is drawing power.  Any other
+        # status ("powered-on", "waiting-for-load", short-circuit, …) or None
+        # is treated as inconclusive and the check is skipped.  This avoids
+        # blocking externally-powered APs which legitimately show
+        # "waiting-for-load" even when online.
         poe_status = client.get_poe_out_status(port)
-        poe_active = poe_status == "powered-on" if poe_status is not None else True
+        poe_active = poe_status != "powered-off" if poe_status is not None else True
 
         # Asymmetric desired computation - see module docstring for rationale.
         if current == "trunk":
