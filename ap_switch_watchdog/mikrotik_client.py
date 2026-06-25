@@ -249,21 +249,19 @@ class MikroTikClient:
             with self._connection_guard():
                 poe = self.api.get_resource(self.ETHERNET_POE_PATH)
                 result = poe.call("monitor", arguments={"interface": port, "count": "1"})
+            logger.debug("%s: PoE monitor result for %s: %s", self.name, port, result)
             if result:
                 live = result[0].get("poe-out-status")
                 if live:
                     return live
         except MikroTikConnectionError:
             raise
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("%s: PoE monitor for %s failed: %s", self.name, port, exc)
 
-        # Fallback: infer from the poe-out config field.  auto-on / forced-on
-        # means the switch will power any device that draws; off means it won't.
-        poe_out = entry.get("poe-out", "off")
-        if poe_out in ("auto-on", "forced-on"):
-            return "powered-on"
-        return "powered-off"
+        # Monitor did not return a live status — return None so callers skip
+        # the PoE check rather than showing a misleading value.
+        return None
 
     # -- port mode switching -------------------------------------------------------
 
