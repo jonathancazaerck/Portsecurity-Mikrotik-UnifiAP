@@ -168,8 +168,9 @@ class APSwitchWatchdog:
         touched_last_cycle: set[tuple[str, str]],
     ) -> None:
         macs_by_port: dict[str, list[str]] = {}
-        for mac, port in client.get_bridge_hosts().items():
-            macs_by_port.setdefault(port, []).append(mac)
+        for mac, ports in client.get_bridge_hosts().items():
+            for port in ports:
+                macs_by_port.setdefault(port, []).append(mac)
 
         logger.debug("%s: bridge MACs by port: %s", sw.name, dict(macs_by_port))
 

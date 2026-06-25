@@ -170,28 +170,30 @@ class MikroTikClient:
 
     # -- discovery ---------------------------------------------------------------
 
-    def get_bridge_hosts(self) -> dict[str, str]:
-        """Return ``{mac (lowercase): bridge port}`` for this switch's bridge.
+    def get_bridge_hosts(self) -> dict[str, list[str]]:
+        """Return ``{mac (lowercase): [bridge ports]}`` for this switch's bridge.
 
-        One ``/interface/bridge/host print`` call covers every learned MAC,
-        so callers should fetch this once per poll cycle rather than calling
-        :meth:`find_port_by_mac` per AP.
+        A MAC can appear on more than one port when two switches share the same
+        L2 segment: the AP's MAC is learned on the direct access port AND
+        visible on inter-switch uplinks.  Returning all ports lets callers
+        check whether the MAC is present on a specific port.
         """
         with self._connection_guard():
             hosts = self.api.get_resource(self.BRIDGE_HOST_PATH)
-            result: dict[str, str] = {}
+            result: dict[str, list[str]] = {}
             for entry in hosts.get():
                 if entry.get("bridge") and entry["bridge"] != self.bridge:
                     continue
                 mac = entry.get("mac-address")
                 on_interface = entry.get("on-interface")
                 if mac and on_interface:
-                    result.setdefault(mac.lower(), on_interface)
+                    result.setdefault(mac.lower(), []).append(on_interface)
             return result
 
     def find_port_by_mac(self, mac: str) -> Optional[str]:
-        """Return the bridge port name a MAC address was learned on, if any."""
-        return self.get_bridge_hosts().get(mac.lower())
+        """Return the first bridge port a MAC address was learned on, if any."""
+        ports = self.get_bridge_hosts().get(mac.lower())
+        return ports[0] if ports else None
 
     def get_vlan_macs_by_port(self, vlan_id: int) -> dict[str, list[str]]:
         """Return ``{port: [mac, ...]}`` for **external** MACs on ``vlan_id``.
