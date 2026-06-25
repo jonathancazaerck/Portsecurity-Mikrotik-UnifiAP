@@ -228,18 +228,32 @@ class MikroTikClient:
         try:
             with self._connection_guard():
                 poe = self.api.get_resource(self.ETHERNET_POE_PATH)
-                entries = poe.get(interface=port)
+                # RouterOS may key the entry by 'name' rather than 'interface'.
+                entries = poe.get(name=port)
+                if not entries:
+                    entries = poe.get(interface=port)
+                if not entries:
+                    # Last resort: scan all entries and match any name-like field.
+                    all_entries = poe.get()
+                    entries = [
+                        e for e in all_entries
+                        if e.get("name") == port or e.get("interface") == port
+                    ]
+                    if not entries and all_entries:
+                        logger.debug(
+                            "%s: PoE entries exist but none match %s; sample: %s",
+                            self.name, port, all_entries[0],
+                        )
         except MikroTikConnectionError:
             raise
         except Exception as exc:
             logger.debug("%s: PoE query for %s failed: %s", self.name, port, exc)
             return None
         if not entries:
-            logger.debug("%s: no PoE entry found for %s", self.name, port)
             return None
         status = entries[0].get("poe-out-status")
         if status is None:
-            logger.debug("%s: PoE entry for %s has no poe-out-status field: %s", self.name, port, entries[0])
+            logger.debug("%s: PoE entry for %s has no poe-out-status: %s", self.name, port, entries[0])
         return status
 
     # -- port mode switching -------------------------------------------------------
