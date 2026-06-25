@@ -136,6 +136,8 @@ class APSwitchWatchdog:
             self._unifi_down = False
             logger.info("UniFi controller connection restored")
 
+        logger.debug("UniFi: %d known AP MACs: %s", len(known_ap_macs), sorted(known_ap_macs))
+
         touched_last_cycle = self._touched_ports
         self._touched_ports = set()
 
@@ -168,6 +170,8 @@ class APSwitchWatchdog:
         macs_by_port: dict[str, list[str]] = {}
         for mac, port in client.get_bridge_hosts().items():
             macs_by_port.setdefault(port, []).append(mac)
+
+        logger.debug("%s: bridge MACs by port: %s", sw.name, dict(macs_by_port))
 
         mgmt_macs_by_port = client.get_vlan_macs_by_port(self.config.vlans.management)
 
