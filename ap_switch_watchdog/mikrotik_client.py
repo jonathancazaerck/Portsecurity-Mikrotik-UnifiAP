@@ -248,7 +248,7 @@ class MikroTikClient:
         try:
             with self._connection_guard():
                 poe = self.api.get_resource(self.ETHERNET_POE_PATH)
-                result = poe.call("monitor", arguments={"interface": port, "count": "1"})
+                result = poe.call("monitor", arguments={"numbers": port, "count": "1"})
             logger.debug("%s: PoE monitor result for %s: %s", self.name, port, result)
             if result:
                 live = result[0].get("poe-out-status")
