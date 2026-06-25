@@ -228,22 +228,10 @@ class MikroTikClient:
         try:
             with self._connection_guard():
                 poe = self.api.get_resource(self.ETHERNET_POE_PATH)
-                # RouterOS may key the entry by 'name' rather than 'interface'.
+                # RouterOS keys the entry by 'name', not 'interface'.
                 entries = poe.get(name=port)
                 if not entries:
                     entries = poe.get(interface=port)
-                if not entries:
-                    # Last resort: scan all entries and match any name-like field.
-                    all_entries = poe.get()
-                    entries = [
-                        e for e in all_entries
-                        if e.get("name") == port or e.get("interface") == port
-                    ]
-                    if not entries and all_entries:
-                        logger.debug(
-                            "%s: PoE entries exist but none match %s; sample: %s",
-                            self.name, port, all_entries[0],
-                        )
         except MikroTikConnectionError:
             raise
         except Exception as exc:
@@ -251,10 +239,29 @@ class MikroTikClient:
             return None
         if not entries:
             return None
-        status = entries[0].get("poe-out-status")
-        if status is None:
-            logger.debug("%s: PoE entry for %s has no poe-out-status: %s", self.name, port, entries[0])
-        return status
+        entry = entries[0]
+
+        # poe-out-status is a runtime property that RouterOS does not include in
+        # the standard GET response.  The monitor command returns live data.
+        try:
+            with self._connection_guard():
+                poe = self.api.get_resource(self.ETHERNET_POE_PATH)
+                result = poe.call("monitor", arguments={"interface": port, "count": "1"})
+            if result:
+                live = result[0].get("poe-out-status")
+                if live:
+                    return live
+        except MikroTikConnectionError:
+            raise
+        except Exception:
+            pass
+
+        # Fallback: infer from the poe-out config field.  auto-on / forced-on
+        # means the switch will power any device that draws; off means it won't.
+        poe_out = entry.get("poe-out", "off")
+        if poe_out in ("auto-on", "forced-on"):
+            return "powered-on"
+        return "powered-off"
 
     # -- port mode switching -------------------------------------------------------
 
