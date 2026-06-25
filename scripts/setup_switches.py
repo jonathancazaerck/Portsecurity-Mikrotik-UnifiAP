@@ -42,10 +42,11 @@ def setup_switch(client: MikroTikClient, switch: SwitchConfig, config: WatchdogC
         client.ensure_static_vlan(vlan_id)
 
     for port in switch.ap_ports:
+        client.ensure_hw_offload_disabled(port)
         client.ensure_dot1x_entry(port, enabled=True)
         client.set_port_mode(port, "onboarding", config.vlans)
         logger.info(
-            "%s: %s baseline = onboarding (VLAN %s, dot1x active)",
+            "%s: %s baseline = onboarding (VLAN %s, dot1x active, HW offload off)",
             switch.name, port, config.vlans.onboarding,
         )
 

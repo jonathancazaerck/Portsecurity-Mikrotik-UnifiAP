@@ -425,6 +425,25 @@ class MikroTikClient:
         vlans.add(bridge=self.bridge, vlan_ids=str(vlan_id), tagged=tagged, untagged=untagged)
         logger.info("%s: created static VLAN %s on %s", self.name, vlan_id, self.bridge)
 
+    def ensure_hw_offload_disabled(self, port: str) -> None:
+        """Ensure hardware offloading is disabled on the bridge port for ``port``.
+
+        HW offloading must be off on AP ports so that dot1x and VLAN filtering
+        are handled in software.  Without this, the switch chip can bypass the
+        802.1X authenticator entirely.
+        """
+        ports = self.api.get_resource(self.BRIDGE_PORT_PATH)
+        entries = [e for e in ports.get(interface=port) if e.get("bridge") == self.bridge]
+        if not entries:
+            raise PortNotFoundError(
+                f"{self.name}: {port} is not a port of bridge {self.bridge}"
+            )
+        entry = entries[0]
+        if entry.get("hw") == "no":
+            return
+        ports.set(id=entry["id"], hw="no")
+        logger.info("%s: disabled HW offloading on %s", self.name, port)
+
     def ensure_dot1x_entry(self, port: str, *, enabled: bool) -> None:
         """Create or update the ``/interface/dot1x/server`` entry for ``port``.
 
