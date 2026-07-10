@@ -58,6 +58,16 @@ class FakeResource:
         entry_id = kwargs["id"]
         self._table[:] = [e for e in self._table if e.get("id") != entry_id]
 
+    def call(self, command: str, arguments: dict | None = None) -> list[dict]:
+        if command == "monitor":
+            numbers = (arguments or {}).get("numbers", "")
+            return [
+                dict(entry)
+                for entry in self._table
+                if entry.get("interface") == numbers or entry.get("name") == numbers
+            ]
+        raise NotImplementedError(f"FakeResource.call({command!r}) not implemented")
+
 
 class FakeApi:
     def __init__(self, db: dict[str, list[dict]]):

@@ -135,6 +135,15 @@ class APSwitchWatchdog:
         if self._unifi_down:
             self._unifi_down = False
             logger.info("UniFi controller connection restored")
+            # Reset per-port timestamps so ports that were in trunk during the
+            # outage get a full grace window to reconnect to the controller.
+            # Without this, an outage longer than trunk_grace_period causes
+            # trunk ports to flip to onboarding, cutting APs off from the
+            # management VLAN — which prevents them from reconnecting and
+            # creates a deadlock.
+            now = time.monotonic()
+            for key in self._last_connected:
+                self._last_connected[key] = now
 
         logger.debug("UniFi: %d known AP MACs: %s", len(known_ap_macs), sorted(known_ap_macs))
 

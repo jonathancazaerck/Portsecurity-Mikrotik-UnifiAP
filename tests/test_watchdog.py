@@ -472,3 +472,58 @@ def test_trunked_port_reverts_after_grace_period_expires(config, sw01, vlans):
 
     assert _port(db, "ether2")["pvid"] == str(vlans.onboarding)
     assert _dot1x(db, "ether2")["disabled"] == "no"
+
+
+# -- UniFi outage longer than grace period -----------------------------------------
+
+
+def test_trunked_port_stays_trunked_after_long_unifi_outage(config, sw01, vlans):
+    """Trunk port must not get stuck in onboarding after a long controller outage.
+
+    Scenario:
+    1. AP is trunked normally.
+    2. UniFi controller goes away for longer than trunk_grace_period.
+    3. Controller comes back.
+    4. Port must NOT flip to onboarding (which would cut the AP off and
+       prevent it from ever reconnecting to the controller — deadlock).
+    """
+    import time
+
+    db, client = sw01
+
+    class ToggleUniFi:
+        def __init__(self):
+            self.down = False
+            self.known = {AP1}
+            self.connected = {AP1}
+
+        def get_ap_macs(self):
+            if self.down:
+                raise UniFiError("controller unreachable")
+            return set(self.known), set(self.connected)
+
+    unifi = ToggleUniFi()
+    wd = APSwitchWatchdog(config, unifi_client=unifi, switches={"sw01": client})
+
+    wd.poll_once()  # trunk ether2 (touched)
+    wd.poll_once()  # settle cycle
+
+    assert _port(db, "ether2")["pvid"] == str(vlans.management)
+
+    # Simulate the controller being down for longer than trunk_grace_period by
+    # backdating _last_connected — mimics what happens after a real outage.
+    far_past = time.monotonic() - (config.trunk_grace_period + 60)
+    for key in wd._last_connected:
+        wd._last_connected[key] = far_past
+
+    unifi.down = True
+    wd.poll_once()  # skipped: UniFi unreachable (_unifi_down set to True)
+    wd.poll_once()  # skipped again
+
+    # Controller comes back; _last_connected must be reset so grace_ok=True.
+    unifi.down = False
+    wd.poll_once()
+
+    # Port must still be in trunk — not flipped to onboarding.
+    assert _port(db, "ether2")["pvid"] == str(vlans.management)
+    assert _dot1x(db, "ether2")["disabled"] == "yes"
