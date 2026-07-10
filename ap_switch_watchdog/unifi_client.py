@@ -136,6 +136,15 @@ class UniFiClient:
         if self._api_prefix is None:
             self.login()
 
+        try:
+            return self._get_devices_inner()
+        except Exception:
+            # Reset so the next cycle re-runs login + prefix auto-detection
+            # instead of re-using a stale or wrong prefix indefinitely.
+            self._api_prefix = None
+            raise
+
+    def _get_devices_inner(self) -> list[dict]:
         url = f"{self.base_url}{self._api_prefix}/api/s/{self.site}/stat/device"
         resp = self._get(url)
         if resp.status_code == 401:
